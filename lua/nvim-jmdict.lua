@@ -1,0 +1,893 @@
+local M = {}
+
+local default_options = {
+  visual_mode_keymap = "<leader>je",
+  normal_mode_keymap = "<leader>je",
+  keymap_options = { noremap = true, silent = true },
+  -- Path to a JMdict JSON file: an array of entries shaped like
+  -- { id, kanji = { { text } }, kana = { { text } },
+  --   sense = { { partOfSpeech = {...}, gloss = { { lang, text } } } } }
+  dictionary_path = vim.fn.stdpath("data") .. "/jmdict.json",
+  -- Path to the compact lookup index (auto-generated, mtime-invalidated).
+  cache_path = vim.fn.stdpath("cache") .. "/nvim-jmdict-index.json",
+  -- string.format pattern for the text inserted after the word; %s receives
+  -- the joined glosses.
+  insert_format = " (%s)",
+  -- Separator between glosses, both in the picker and in the inserted text.
+  gloss_separator = "; ",
+  -- Normal mode: the longest substring (in characters) starting at the cursor
+  -- that is tried against the dictionary.
+  max_prefix_length = 12,
+}
+
+-- ---------------------------------------------------------------------------
+-- Notification (overridable for tests)
+-- ---------------------------------------------------------------------------
+
+local notify_fn = function(msg, level)
+  vim.notify("[jmdict] " .. msg, level or vim.log.levels.INFO)
+end
+
+local function notify(msg, level)
+  notify_fn(msg, level)
+end
+
+-- Multi-line error reporter that bypasses the cmdline truncation. The message
+-- is appended to :messages history.
+local function report_error(lines)
+  local chunks = {}
+  for i, line in ipairs(lines) do
+    if i > 1 then chunks[#chunks + 1] = { "\n" } end
+    chunks[#chunks + 1] = { "[jmdict] " .. line, "ErrorMsg" }
+  end
+  vim.api.nvim_echo(chunks, true, {})
+end
+
+-- ---------------------------------------------------------------------------
+-- Index loading / building
+-- ---------------------------------------------------------------------------
+
+-- The index is { entries = { { h, pos, g = { gloss... } } }, keys = { [text] = { entry_idx... } } }.
+-- `h` is the display headword, `pos` the first sense's part-of-speech tags,
+-- `g` every English gloss of every sense in order. `keys` maps each kanji form
+-- and kana reading to the entries carrying it, in dictionary (id) order.
+
+local function file_mtime(path)
+  local stat = vim.loop.fs_stat(path)
+  if not stat then return nil end
+  return stat.mtime.sec
+end
+
+local function read_file(path)
+  local f, err = io.open(path, "rb")
+  if not f then return nil, err end
+  local s = f:read("*a")
+  f:close()
+  return s
+end
+
+local function compact_entry(entry)
+  local kanji = entry.kanji and entry.kanji[1] and entry.kanji[1].text
+  local kana = entry.kana and entry.kana[1] and entry.kana[1].text
+  local headword
+  if kanji and kana then
+    headword = kanji .. "（" .. kana .. "）"
+  else
+    headword = kanji or kana or ""
+  end
+
+  local pos = ""
+  local glosses = {}
+  for i, sense in ipairs(entry.sense or {}) do
+    if i == 1 and type(sense.partOfSpeech) == "table" then
+      pos = table.concat(sense.partOfSpeech, ", ")
+    end
+    for _, gloss in ipairs(sense.gloss or {}) do
+      if (gloss.lang == nil or gloss.lang == "eng") and gloss.text then
+        glosses[#glosses + 1] = gloss.text
+      end
+    end
+  end
+  return { h = headword, pos = pos, g = glosses }
+end
+
+local function build_index_from_json(path)
+  if not vim.loop.fs_stat(path) then
+    report_error({
+      "Dictionary not found at " .. path,
+      "Set dictionary_path in setup() to a JMdict JSON file.",
+    })
+    return nil
+  end
+
+  local content, read_err = read_file(path)
+  if not content then
+    report_error({ "Failed to read " .. path, tostring(read_err) })
+    return nil
+  end
+  local ok, data = pcall(vim.json.decode, content)
+  content = nil
+  if not ok or type(data) ~= "table" then
+    report_error({ "Failed to parse " .. path, tostring(data) })
+    return nil
+  end
+
+  local entries = {}
+  local keys = {}
+  local function add_key(text, entry_idx)
+    if not text or text == "" then return end
+    local list = keys[text]
+    if not list then
+      keys[text] = { entry_idx }
+    elseif list[#list] ~= entry_idx then
+      list[#list + 1] = entry_idx
+    end
+  end
+
+  for _, entry in ipairs(data) do
+    local compact = compact_entry(entry)
+    if #compact.g > 0 then
+      entries[#entries + 1] = compact
+      local entry_idx = #entries
+      for _, k in ipairs(entry.kanji or {}) do add_key(k.text, entry_idx) end
+      for _, k in ipairs(entry.kana or {}) do add_key(k.text, entry_idx) end
+    end
+  end
+  return { entries = entries, keys = keys }
+end
+
+local function serialize_index(idx, path)
+  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+  local f, err = io.open(path, "wb")
+  if not f then
+    notify("Could not write cache " .. path .. ": " .. tostring(err),
+      vim.log.levels.WARN)
+    return false
+  end
+  f:write(vim.json.encode(idx))
+  f:close()
+  return true
+end
+
+local function load_cached_index(cache_path, source_path)
+  local cache_mtime = file_mtime(cache_path)
+  local source_mtime = file_mtime(source_path)
+  if not cache_mtime or not source_mtime then return nil end
+  if cache_mtime < source_mtime then return nil end
+  local content = read_file(cache_path)
+  if not content then return nil end
+  local ok, idx = pcall(vim.json.decode, content)
+  if not ok or type(idx) ~= "table" or type(idx.entries) ~= "table"
+      or type(idx.keys) ~= "table" then
+    notify("Cache invalid; rebuilding.", vim.log.levels.WARN)
+    return nil
+  end
+  return idx
+end
+
+local function load_index(force_rebuild)
+  if not force_rebuild and M._index then return M._index end
+
+  local source_path = vim.fn.expand(M.options.dictionary_path)
+  local cache_path = vim.fn.expand(M.options.cache_path)
+
+  if not force_rebuild then
+    local cached = load_cached_index(cache_path, source_path)
+    if cached then
+      M._index = cached
+      return cached
+    end
+  end
+
+  notify("Building index from " .. source_path .. " (one-time)...")
+  local idx = build_index_from_json(source_path)
+  if not idx then return nil end
+  serialize_index(idx, cache_path)
+  M._index = idx
+  return idx
+end
+
+-- ---------------------------------------------------------------------------
+-- Verb deinflection
+-- ---------------------------------------------------------------------------
+
+-- Returns an ordered list of candidate dictionary-form strings for `word`.
+-- Candidates are over-generated intentionally; callers filter by index lookup.
+-- The list is ordered most-specific first so longer suffix matches win.
+--
+-- Strategy:
+--   1. Hard-coded irregular verb forms (する/くる and their kanji compounds).
+--   2. Ichidan (る-verb) endings: strip the ending and append る.
+--   3. Godan (う-verb) endings: reverse the standard conjugation vowel shift.
+--
+-- Only the kana suffix is examined; the kanji stem is kept unchanged.
+-- All kana comparisons are in UTF-8 byte strings (Lua 5.4 default).
+
+-- utf8_len: number of UTF-8 codepoints in s (used to guard minimum stem length)
+local function utf8_len(s)
+  local n = 0
+  local i = 1
+  while i <= #s do
+    local b = s:byte(i)
+    if b >= 0xF0 then i = i + 4
+    elseif b >= 0xE0 then i = i + 3
+    elseif b >= 0xC0 then i = i + 2
+    else i = i + 1
+    end
+    n = n + 1
+  end
+  return n
+end
+
+-- utf8_sub: return the last `n` UTF-8 codepoints of s as a byte string.
+-- Also returns the byte index of the split point so the stem can be extracted.
+local function utf8_last_bytes(s, n)
+  -- Walk from the end: collect codepoint start positions from the back.
+  local positions = {}
+  local i = #s
+  while i >= 1 do
+    local b = s:byte(i)
+    if b < 0x80 or b >= 0xC0 then
+      -- This byte is a codepoint start (ASCII or leading byte of multibyte).
+      table.insert(positions, 1, i)
+      if #positions == n then break end
+    end
+    i = i - 1
+  end
+  if #positions == 0 then return "", #s + 1 end
+  local split = positions[1]
+  return s:sub(split), split
+end
+
+-- Deinflection rule table.
+-- Each entry: { suffix_bytes, replacement_bytes, min_stem_codepoints }
+-- suffix_bytes   : kana suffix to strip (UTF-8 string)
+-- replacement    : kana to append after stripping (UTF-8 string, may be "")
+-- min_stem_cp    : minimum codepoints required in the remaining stem
+--
+-- Rules are tried in order; first matching rule whose stripped stem has at
+-- least min_stem_cp codepoints produces a candidate.  Multiple rules may
+-- fire for the same input — all candidates are returned.
+local DEINFLECT_RULES = {
+  -- -------------------------------------------------------------------------
+  -- Irregular: する and compound verbs ending in する (〜する)
+  -- -------------------------------------------------------------------------
+  -- These are matched as whole-word replacements handled separately below.
+
+  -- -------------------------------------------------------------------------
+  -- Long suffixes first (most specific)
+  -- -------------------------------------------------------------------------
+
+  -- Causative-passive: 〜させられ(る) ← す-verb causative passive
+  { "させられる", "す", 1 },
+  { "させられた", "す", 1 },
+  { "させられて", "す", 1 },
+  { "させられない", "す", 1 },
+  -- Causative: 〜させ(る)
+  { "させる", "す", 1 },
+  { "させた", "す", 1 },
+  { "させて", "す", 1 },
+  { "させない", "す", 1 },
+
+  -- Ichidan causative-passive: 〜させられ ← 〜る (stem + させられ)
+  { "させられる", "る", 1 },
+  { "させられた", "る", 1 },
+  { "させられて", "る", 1 },
+  { "させられない", "る", 1 },
+  -- Ichidan causative: 〜させる
+  { "させる", "る", 1 },
+  { "させた", "る", 1 },
+  { "させて", "る", 1 },
+
+  -- Passive / potential Ichidan: stem + られ
+  { "られる", "る", 1 },
+  { "られた", "る", 1 },
+  { "られて", "る", 1 },
+  { "られない", "る", 1 },
+  { "られれば", "る", 1 },
+
+  -- Polite negative past: 〜ませんでした
+  { "ませんでした", "る", 1 },  -- Ichidan
+  -- Polite negative: 〜ません
+  { "ません", "る", 1 },        -- Ichidan
+  -- Polite past: 〜ました
+  { "ました", "る", 1 },        -- Ichidan
+  -- Polite: 〜ます (Ichidan: strip nothing from stem, add る)
+  -- The masu-stem of Ichidan is the bare stem, so 食べます → 食べ + ます → 食べる
+  { "ます", "る", 1 },
+
+  -- te-iru / te-iru contracted forms (progressive)
+  { "ている", "る", 1 },
+  { "ていた", "る", 1 },
+  { "ていて", "る", 1 },
+  { "ていない", "る", 1 },
+  -- contracted: 〜てる / 〜てた
+  { "てる", "る", 1 },
+  { "てた", "る", 1 },
+
+  -- Negative past: 〜なかった (Ichidan)
+  { "なかった", "る", 1 },
+  -- Negative: 〜ない (Ichidan)
+  { "ない", "る", 1 },
+  -- Negative adverbial: 〜なく (Ichidan)
+  { "なく", "る", 1 },
+
+  -- Conditional: 〜れば (Ichidan)
+  { "れば", "る", 1 },
+  -- Potential Ichidan: 〜られる (already above)
+
+  -- Past / ta-form Ichidan: 〜た
+  { "た", "る", 1 },
+  -- Te-form Ichidan: 〜て
+  { "て", "る", 1 },
+  -- Volitional Ichidan: 〜よう
+  { "よう", "る", 1 },
+  -- Imperative Ichidan: 〜ろ / 〜よ
+  { "ろ", "る", 1 },
+  { "よ", "る", 1 },
+
+  -- -------------------------------------------------------------------------
+  -- Godan (う-verb) conjugation reversal
+  -- Each godan column ends in a different vowel row:
+  --   dict  | a-row | i-row | te/ta | e-row
+  --   く    | か    | き    | いて  | け
+  --   ぐ    | が    | ぎ    | いで  | げ
+  --   す    | さ    | し    | して  | せ
+  --   つ    | た    | ち    | って  | て
+  --   ぬ    | な    | に    | んで  | ね
+  --   ぶ    | ば    | び    | んで  | べ
+  --   む    | ま    | み    | んで  | め
+  --   る    | ら    | り    | って  | れ
+  --   う    | わ    | い    | って  | え
+  -- -------------------------------------------------------------------------
+
+  -- Godan polite negative past
+  { "きませんでした", "く", 1 },
+  { "ぎませんでした", "ぐ", 1 },
+  { "しませんでした", "す", 1 },
+  { "ちませんでした", "つ", 1 },
+  { "にませんでした", "ぬ", 1 },
+  { "びませんでした", "ぶ", 1 },
+  { "みませんでした", "む", 1 },
+  { "りませんでした", "る", 1 },
+  { "いませんでした", "う", 1 },
+
+  -- Godan polite negative: 〜ません
+  { "きません", "く", 1 },
+  { "ぎません", "ぐ", 1 },
+  { "しません", "す", 1 },
+  { "ちません", "つ", 1 },
+  { "にません", "ぬ", 1 },
+  { "びません", "ぶ", 1 },
+  { "みません", "む", 1 },
+  { "りません", "る", 1 },
+  { "いません", "う", 1 },
+
+  -- Godan polite past: 〜ました
+  { "きました", "く", 1 },
+  { "ぎました", "ぐ", 1 },
+  { "しました", "す", 1 },
+  { "ちました", "つ", 1 },
+  { "にました", "ぬ", 1 },
+  { "びました", "ぶ", 1 },
+  { "みました", "む", 1 },
+  { "りました", "る", 1 },
+  { "いました", "う", 1 },
+
+  -- Godan polite: 〜ます
+  { "きます", "く", 1 },
+  { "ぎます", "ぐ", 1 },
+  { "します", "す", 1 },
+  { "ちます", "つ", 1 },
+  { "にます", "ぬ", 1 },
+  { "びます", "ぶ", 1 },
+  { "みます", "む", 1 },
+  { "ります", "る", 1 },
+  { "います", "う", 1 },
+
+  -- Godan negative past: 〜なかった
+  { "かなかった", "く", 1 },
+  { "がなかった", "ぐ", 1 },
+  { "さなかった", "す", 1 },
+  { "たなかった", "つ", 1 },
+  { "ななかった", "ぬ", 1 },
+  { "ばなかった", "ぶ", 1 },
+  { "まなかった", "む", 1 },
+  { "らなかった", "る", 1 },
+  { "わなかった", "う", 1 },
+
+  -- Godan negative: 〜ない
+  { "かない", "く", 1 },
+  { "がない", "ぐ", 1 },
+  { "さない", "す", 1 },
+  { "たない", "つ", 1 },
+  { "なない", "ぬ", 1 },
+  { "ばない", "ぶ", 1 },
+  { "まない", "む", 1 },
+  { "らない", "る", 1 },
+  { "わない", "う", 1 },
+
+  -- Godan te-iru (progressive): 〜いている
+  { "いている", "く", 1 },
+  { "いでいる", "ぐ", 1 },
+  { "している", "す", 1 },
+  { "していた", "す", 1 },
+  { "していない", "す", 1 },
+  { "っている", "つ", 1 },
+  { "んでいる", "ぬ", 1 },
+  { "んでいる", "ぶ", 1 },
+  { "んでいる", "む", 1 },
+  { "っている", "る", 1 },
+  { "っている", "う", 1 },
+
+  -- Godan te-form + た/て (past/te)
+  -- く → いた / いて
+  { "いた", "く", 1 },
+  { "いて", "く", 1 },
+  -- ぐ → いだ / いで
+  { "いだ", "ぐ", 1 },
+  { "いで", "ぐ", 1 },
+  -- す → した / して
+  { "した", "す", 1 },
+  { "して", "す", 1 },
+  -- つ → った / って
+  { "った", "つ", 1 },
+  { "って", "つ", 1 },
+  -- ぬ → んだ / んで
+  { "んだ", "ぬ", 1 },
+  { "んで", "ぬ", 1 },
+  -- ぶ → んだ / んで
+  { "んだ", "ぶ", 1 },
+  { "んで", "ぶ", 1 },
+  -- む → んだ / んで
+  { "んだ", "む", 1 },
+  { "んで", "む", 1 },
+  -- る → った / って  (Godan る)
+  { "った", "る", 1 },
+  { "って", "る", 1 },
+  -- う → った / って
+  { "った", "う", 1 },
+  { "って", "う", 1 },
+
+  -- Godan conditional: 〜eba row (e-row + ば)
+  { "けば", "く", 1 },
+  { "げば", "ぐ", 1 },
+  { "せば", "す", 1 },
+  { "てば", "つ", 1 },
+  { "ねば", "ぬ", 1 },
+  { "べば", "ぶ", 1 },
+  { "めば", "む", 1 },
+  { "れば", "る", 1 },
+  { "えば", "う", 1 },
+
+  -- Godan potential: e-row + る
+  { "ける", "く", 1 },
+  { "げる", "ぐ", 1 },
+  { "せる", "す", 1 },
+  { "てる", "つ", 1 },
+  { "ねる", "ぬ", 1 },
+  { "べる", "ぶ", 1 },
+  { "める", "む", 1 },
+  { "れる", "る", 1 },
+  { "える", "う", 1 },
+
+  -- Godan passive: a-row + れる
+  { "かれる", "く", 1 },
+  { "がれる", "ぐ", 1 },
+  { "される", "す", 1 },
+  { "たれる", "つ", 1 },
+  { "なれる", "ぬ", 1 },
+  { "ばれる", "ぶ", 1 },
+  { "まれる", "む", 1 },
+  { "られる", "る", 1 },
+  { "われる", "う", 1 },
+
+  -- Godan causative: a-row + せる/させる
+  { "かせる", "く", 1 },
+  { "がせる", "ぐ", 1 },
+  { "させる", "す", 1 },
+  { "たせる", "つ", 1 },
+  { "なせる", "ぬ", 1 },
+  { "ばせる", "ぶ", 1 },
+  { "ませる", "む", 1 },
+  { "らせる", "る", 1 },
+  { "わせる", "う", 1 },
+
+  -- Godan causative-passive: a-row + せられる
+  { "かせられる", "く", 1 },
+  { "がせられる", "ぐ", 1 },
+  { "させられる", "す", 1 },
+  { "たせられる", "つ", 1 },
+  { "なせられる", "ぬ", 1 },
+  { "ばせられる", "ぶ", 1 },
+  { "ませられる", "む", 1 },
+  { "らせられる", "る", 1 },
+  { "わせられる", "う", 1 },
+
+  -- Godan causative-passive, short: a-row + される (not used by す-verbs)
+  { "かされる", "く", 1 },
+  { "がされる", "ぐ", 1 },
+  { "たされる", "つ", 1 },
+  { "なされる", "ぬ", 1 },
+  { "ばされる", "ぶ", 1 },
+  { "まされる", "む", 1 },
+  { "らされる", "る", 1 },
+  { "わされる", "う", 1 },
+
+  -- Godan causative-passive, colloquial: a-row + せれる
+  { "かせれる", "く", 1 },
+  { "がせれる", "ぐ", 1 },
+  { "させれる", "す", 1 },
+  { "たせれる", "つ", 1 },
+  { "なせれる", "ぬ", 1 },
+  { "ばせれる", "ぶ", 1 },
+  { "ませれる", "む", 1 },
+  { "らせれる", "る", 1 },
+  { "わせれる", "う", 1 },
+  -- Ichidan causative-passive, colloquial: 〜させれる
+  { "させれる", "る", 1 },
+
+  -- Godan volitional: o-row + う
+  { "こう", "く", 1 },
+  { "ごう", "ぐ", 1 },
+  { "そう", "す", 1 },
+  { "とう", "つ", 1 },
+  { "のう", "ぬ", 1 },
+  { "ぼう", "ぶ", 1 },
+  { "もう", "む", 1 },
+  { "ろう", "る", 1 },
+  { "おう", "う", 1 },
+
+  -- Godan imperative: e-row bare
+  { "け", "く", 1 },
+  { "げ", "ぐ", 1 },
+  { "せ", "す", 1 },
+  { "て", "つ", 1 },
+  { "ね", "ぬ", 1 },
+  { "べ", "ぶ", 1 },
+  { "め", "む", 1 },
+  { "れ", "る", 1 },
+  { "え", "う", 1 },
+
+  -- Godan masu-stem (i-row): used in compounds but also standalone misses
+  { "き", "く", 1 },
+  { "ぎ", "ぐ", 1 },
+  { "し", "す", 1 },
+  { "ち", "つ", 1 },
+  { "に", "ぬ", 1 },
+  { "び", "ぶ", 1 },
+  { "み", "む", 1 },
+  { "り", "る", 1 },
+  { "い", "う", 1 },
+}
+
+-- Irregular verb hard-coded mappings.
+-- Key: conjugated kana suffix that appears at the END of the full word.
+-- Value: { stem_kana_suffix_to_strip, replacement } where the FULL word's
+-- kana tail is replaced.  Simpler: we list full kana-tail patterns.
+-- For compound する verbs (愛する, 勉強する) we handle the する/する tail specially.
+local IRREGULAR_RULES = {
+  -- くる (来る) forms
+  { "きた",     "くる" },
+  { "きて",     "くる" },
+  { "きない",   "くる" },
+  { "きません", "くる" },
+  { "きます",   "くる" },
+  { "こない",   "くる" },
+  { "こよう",   "くる" },
+  { "こられる", "くる" },
+  { "こい",     "くる" },
+  { "くれば",   "くる" },
+  -- する forms
+  { "した",     "する" },
+  { "して",     "する" },
+  { "しない",   "する" },
+  { "しません", "する" },
+  { "しました", "する" },
+  { "します",   "する" },
+  { "しよう",   "する" },
+  { "される",   "する" },
+  { "させる",   "する" },
+  { "すれば",   "する" },
+  { "しろ",     "する" },
+  { "せよ",     "する" },
+  { "できる",   "する" },  -- potential of する (informal)
+}
+
+-- Derived stems (potential, passive, causative, causative-passive) conjugate
+-- like Ichidan verbs, so rules are re-applied to each candidate up to this
+-- depth, e.g. 書けました → 書ける → 書く.
+local MAX_DEINFLECT_DEPTH = 3
+-- Safety cap on the total number of candidates generated.
+local MAX_DEINFLECT_CANDIDATES = 200
+
+-- Applies every rule once to `word`, passing each candidate to `add`.
+local function deinflect_once(word, add)
+  -- 1. Irregular rules: match kana tail of `word`.
+  for _, rule in ipairs(IRREGULAR_RULES) do
+    local conj_tail, dict_tail = rule[1], rule[2]
+    -- Check if `word` ends with conj_tail (byte suffix match).
+    if #word >= #conj_tail and word:sub(- #conj_tail) == conj_tail then
+      local stem = word:sub(1, #word - #conj_tail)
+      -- For plain する/くる (no kanji stem), the stem is empty and we just
+      -- return the dict_tail itself.
+      if stem == "" then
+        add(dict_tail)
+      else
+        add(stem .. dict_tail)
+      end
+    end
+  end
+
+  -- 2. Compound する verbs: if word ends in する conjugations, try 〜する.
+  -- Already handled above for する itself; here handle 〜する where the word
+  -- has a kanji/kana stem before する.
+  -- e.g. 勉強した → check 勉強 + する path via "した" → "する" above.
+  -- Already covered; no extra work needed.
+
+  -- 3. General rules: strip suffix, append replacement.
+  for _, rule in ipairs(DEINFLECT_RULES) do
+    local suffix, repl, min_cp = rule[1], rule[2], rule[3]
+    local suf_len = #suffix
+    if #word > suf_len and word:sub(-suf_len) == suffix then
+      local stem = word:sub(1, #word - suf_len)
+      -- Ensure the stem has at least min_cp codepoints.
+      if utf8_len(stem) >= min_cp then
+        add(stem .. repl)
+      end
+    end
+  end
+end
+
+-- Returns candidates grouped by depth: { {depth-1...}, {depth-2...}, ... }.
+-- Breadth-first, so single-step candidates always precede chained ones.
+local function deinflect_levels(word)
+  if not word or #word == 0 then return {} end
+
+  local seen = { [word] = true }
+  local count = 0
+  local levels = {}
+  local level = { word }
+
+  for _ = 1, MAX_DEINFLECT_DEPTH do
+    local next_level = {}
+    local function add(c)
+      if not seen[c] and count < MAX_DEINFLECT_CANDIDATES then
+        seen[c] = true
+        count = count + 1
+        next_level[#next_level + 1] = c
+      end
+    end
+    for _, w in ipairs(level) do
+      deinflect_once(w, add)
+    end
+    if #next_level == 0 then break end
+    levels[#levels + 1] = next_level
+    level = next_level
+  end
+
+  return levels
+end
+
+-- Flat list of every candidate, shallowest first.
+local function deinflect(word)
+  local candidates = {}
+  for _, level in ipairs(deinflect_levels(word)) do
+    for _, c in ipairs(level) do candidates[#candidates + 1] = c end
+  end
+  return candidates
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Lookup
+-- ---------------------------------------------------------------------------
+
+-- Returns the entries matching `word` exactly (kanji form or kana reading),
+-- or, failing that, the union of entries matching the deinflected dictionary
+-- forms of the shallowest deinflection depth that has any match, so chained
+-- candidates never add rows to a word that resolves in fewer steps. Returns
+-- nil when nothing matches.
+local function find_entries(idx, word)
+  local hits = idx.keys[word]
+  if hits and #hits > 0 then
+    local entries = {}
+    for _, i in ipairs(hits) do entries[#entries + 1] = idx.entries[i] end
+    return entries
+  end
+
+  local seen = {}
+  local entries = {}
+  for _, level in ipairs(deinflect_levels(word)) do
+    for _, dict_form in ipairs(level) do
+      for _, i in ipairs(idx.keys[dict_form] or {}) do
+        if not seen[i] then
+          seen[i] = true
+          entries[#entries + 1] = idx.entries[i]
+        end
+      end
+    end
+    if #entries > 0 then return entries end
+  end
+  return nil
+end
+
+-- Longest-prefix match: try the longest run of characters starting at byte
+-- `start` of `text` (at most `max_chars`), shortening one character at a time
+-- until find_entries hits. Returns the entries and the matched byte length.
+local function find_longest_prefix(idx, text, start, max_chars)
+  local ends = {}
+  local i = start
+  while i <= #text and #ends < max_chars do
+    local b = text:byte(i)
+    if b >= 0xF0 then i = i + 4
+    elseif b >= 0xE0 then i = i + 3
+    elseif b >= 0xC0 then i = i + 2
+    else i = i + 1
+    end
+    ends[#ends + 1] = math.min(i - 1, #text)
+  end
+
+  for n = #ends, 1, -1 do
+    local word = text:sub(start, ends[n])
+    if not word:match("^%s") and not word:match("%s$") then
+      local entries = find_entries(idx, word)
+      if entries then return entries, #word end
+    end
+  end
+  return nil, 0
+end
+
+local function format_item(entry)
+  local label = entry.h
+  if entry.pos and entry.pos ~= "" then
+    label = label .. " [" .. entry.pos .. "]"
+  end
+  return label .. " " .. table.concat(entry.g, M.options.gloss_separator)
+end
+
+local function format_insertion(entry)
+  return string.format(M.options.insert_format,
+    table.concat(entry.g, M.options.gloss_separator))
+end
+
+-- Presents `entries` via vim.ui.select (always, even for a single entry) and
+-- calls `callback` with the text to insert for the chosen entry.
+local function select_entry(word, entries, callback)
+  vim.ui.select(entries, {
+    prompt = "JMdict: " .. word,
+    format_item = format_item,
+  }, function(choice)
+    if choice then callback(format_insertion(choice)) end
+  end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Buffer handlers
+-- ---------------------------------------------------------------------------
+
+local function get_visual_selection()
+  local a_save = vim.fn.getreg('a')
+  local a_save_type = vim.fn.getregtype('a')
+  vim.cmd('normal! "ay')
+  vim.cmd('normal! `>')
+  local selection = vim.fn.getreg('a')
+  vim.fn.setreg('a', a_save, a_save_type)
+  return selection
+end
+
+-- Insert text after the position of the '> mark in the given buffer. Robust
+-- against the user moving the cursor while vim.ui.select is open. The '> mark
+-- column is the byte offset of the *first* byte of the last selected
+-- character, so we must skip the full UTF-8 codepoint width.
+local function insert_after_mark(bufnr, mark, text)
+  local pos = vim.api.nvim_buf_get_mark(bufnr, mark)
+  local row, col = pos[1], pos[2]
+  if row == 0 then return end
+  local line = vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or ""
+  local b = line:byte(col + 1) or 0
+  local char_len = 1
+  if b >= 0xF0 then char_len = 4
+  elseif b >= 0xE0 then char_len = 3
+  elseif b >= 0xC0 then char_len = 2
+  end
+  local insert_col = math.min(col + char_len, #line)
+  vim.api.nvim_buf_set_text(bufnr, row - 1, insert_col, row - 1, insert_col, { text })
+end
+
+local function lookup_and_write_after_visual_selection()
+  local selected = vim.trim(get_visual_selection():gsub("\n", ""))
+  local bufnr = vim.api.nvim_get_current_buf()
+  if selected == "" then return end
+  local idx = load_index()
+  if not idx then return end
+  local entries = find_entries(idx, selected)
+  if not entries then
+    notify("No translation found for: " .. selected)
+    return
+  end
+  select_entry(selected, entries, function(text)
+    insert_after_mark(bufnr, '>', text)
+  end)
+end
+
+local function lookup_and_write_after_current_word()
+  local bufnr = vim.api.nvim_get_current_buf()
+  -- Capture the insertion point before the (async) picker opens so it is
+  -- stable even if the cursor moves meanwhile. The cursor column is the byte
+  -- offset of the first byte of the character under the cursor.
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  local line = vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or ""
+  if col >= #line then return end
+  local idx = load_index()
+  if not idx then return end
+  local entries, match_len = find_longest_prefix(idx, line, col + 1,
+    M.options.max_prefix_length)
+  if not entries then
+    notify("No translation found at cursor")
+    return
+  end
+  local word = line:sub(col + 1, col + match_len)
+  local insert_col_pre = col + match_len
+  select_entry(word, entries, function(text)
+    local cur = vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or ""
+    local insert_col = math.min(insert_col_pre, #cur)
+    vim.api.nvim_buf_set_text(bufnr, row - 1, insert_col, row - 1, insert_col, { text })
+  end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Setup
+-- ---------------------------------------------------------------------------
+
+M.setup = function(options)
+  M.options = vim.tbl_deep_extend("force", default_options, options or {})
+
+  vim.keymap.set(
+    "x",
+    M.options.visual_mode_keymap,
+    function() lookup_and_write_after_visual_selection() end,
+    vim.tbl_extend("force", M.options.keymap_options, { desc = "JMdict to English (Visual Mode)" })
+  )
+  vim.keymap.set(
+    "n",
+    M.options.normal_mode_keymap,
+    function() lookup_and_write_after_current_word() end,
+    vim.tbl_extend("force", M.options.keymap_options, { desc = "JMdict to English (Normal Mode)" })
+  )
+
+  vim.api.nvim_create_user_command("JmdictRebuildIndex", function()
+    M._index = nil
+    pcall(os.remove, vim.fn.expand(M.options.cache_path))
+    if load_index(true) then
+      notify("Index rebuilt.")
+    end
+  end, { desc = "Rebuild the JMdict lookup index" })
+end
+
+-- ---------------------------------------------------------------------------
+-- Test-only surface (not stable API)
+-- ---------------------------------------------------------------------------
+
+M._defaults_for_test = function()
+  return vim.deepcopy(default_options)
+end
+
+M._internal = {
+  build_index_from_json = build_index_from_json,
+  serialize_index = serialize_index,
+  load_cached_index = load_cached_index,
+  load_index = load_index,
+  deinflect = deinflect,
+  find_entries = find_entries,
+  find_longest_prefix = find_longest_prefix,
+  format_item = format_item,
+  format_insertion = format_insertion,
+  lookup_and_write_after_visual_selection = lookup_and_write_after_visual_selection,
+  lookup_and_write_after_current_word = lookup_and_write_after_current_word,
+  set_notify = function(fn)
+    notify_fn = fn or function() end
+  end,
+}
+
+return M

@@ -1,0 +1,12 @@
+[
+{"id":1000010,"kana":[{"text":"ゝ"}],"sense":[{"partOfSpeech":["unc"],"gloss":[{"lang":"eng","type":"expl","text":"repetition mark in hiragana"}]}]},
+{"id":1157170,"kanji":[{"text":"研究"}],"kana":[{"text":"けんきゅう"}],"sense":[{"partOfSpeech":["n","vs"],"gloss":[{"lang":"eng","text":"study"},{"lang":"eng","text":"research"}]},{"partOfSpeech":["n"],"gloss":[{"lang":"eng","text":"investigation"},{"lang":"ger","text":"Forschung"}]}]},
+{"id":1157190,"kanji":[{"text":"研究者"}],"kana":[{"text":"けんきゅうしゃ"}],"sense":[{"partOfSpeech":["n"],"gloss":[{"lang":"eng","text":"researcher"}]}]},
+{"id":1358280,"kanji":[{"text":"食べる"},{"text":"喰べる"}],"kana":[{"text":"たべる"}],"sense":[{"partOfSpeech":["v1","vt"],"gloss":[{"lang":"eng","text":"to eat"}]}]},
+{"id":1358300,"kanji":[{"text":"食"}],"kana":[{"text":"しょく"}],"sense":[{"partOfSpeech":["n"],"gloss":[{"lang":"eng","text":"food"}]}]},
+{"id":1579110,"kanji":[{"text":"今日"}],"kana":[{"text":"きょう"},{"text":"こんにち"}],"sense":[{"partOfSpeech":["n"],"gloss":[{"lang":"eng","text":"today"}]}]},
+{"id":1590670,"kanji":[{"text":"来る"}],"kana":[{"text":"くる"}],"sense":[{"partOfSpeech":["vk","vi"],"gloss":[{"lang":"eng","text":"to come"}]}]},
+{"id":1221900,"kanji":[{"text":"紙"}],"kana":[{"text":"かみ"}],"sense":[{"partOfSpeech":["n"],"gloss":[{"lang":"eng","text":"paper"}]}]},
+{"id":1581860,"kanji":[{"text":"神"}],"kana":[{"text":"かみ"}],"sense":[{"partOfSpeech":["n"],"gloss":[{"lang":"eng","text":"god"},{"lang":"eng","text":"deity"}]}]},
+{"id":2000000,"kanji":[{"text":"無英語"}],"kana":[{"text":"むえいご"}],"sense":[{"partOfSpeech":["n"],"gloss":[{"lang":"ger","text":"nur deutsch"}]}]}
+]
